@@ -1,0 +1,272 @@
+DELIMITER $$
+
+CREATE PROCEDURE BorrowBook(
+    IN p_user_name VARCHAR(50),
+    IN p_copy_id INT,
+    IN p_book_name VARCHAR(255)
+)
+BEGIN
+    DECLARE v_user_exists INT;
+    DECLARE v_user_type VARCHAR(20);
+    DECLARE v_current_borrowed INT;
+    DECLARE v_max_allowed INT;
+    DECLARE v_copy_status VARCHAR(20);
+    SELECT COUNT(*), USER_TYPE, CURRENT_BORROWED 
+    INTO v_user_exists, v_user_type, v_current_borrowed
+    FROM users 
+    WHERE USER_NAME = p_user_name 
+      AND PERMISSION = TRUE;
+    
+    IF v_user_exists = 0 THEN
+        SIGNAL SQLSTATE '45000' ;
+    END IF;
+
+    SELECT MAX_INT INTO v_max_allowed 
+    FROM BORROW_RULES 
+    WHERE USER_TYPE = v_user_type;
+    IF v_current_borrowed >= v_max_allowed THEN
+        SIGNAL SQLSTATE '45000' ;
+    END IF;
+    SELECT STATUS INTO v_copy_status 
+    FROM COPY 
+    WHERE COPY_ID = p_copy_id;
+    
+    IF v_copy_status != 'AVAILABLE' THEN
+        SIGNAL SQLSTATE '45000' 
+        SET MESSAGE_TEXT = '图书已被借出或不可用';
+    END IF;
+    INSERT INTO MUTIFUNCTIONALLOGS(
+        USER_NAME, 
+        BOOK_NAME, 
+        COPY_ID, 
+        BORROW_DATE
+    ) VALUES (
+        p_user_name,
+        p_book_name,
+        p_copy_id,
+        CURDATE()
+    );
+    
+    SELECT '借书成功' AS result;
+END $$
+
+DELIMITER ;//借书
+
+
+
+DELIMITER $$
+CREATE PROCEDURE RETURNBOOKS(IN p_copy_id INT)
+BEGIN 
+DECLARE v_log_id INT;
+DECLARE v_borrow_date DATE;
+DECLARE v_user_id INT;
+
+SELECT LOG_ID,BORROW_DATE,USER_ID 
+INTO v_log_id,v_borrow_date,v_user_id
+FROM mutifunctionallogs
+WHERE COPY_ID=p_copy_id
+ORDER BY BORROW_DATE DESC
+LIMIT 1;
+
+ IF v_log_id IS NULL THEN
+     SIGNAL SQLSTATE '45000' 
+     SET MESSAGE_TEXT = '没有找到借阅记录';
+END IF;
+
+UPDATE mutifunctionallogs
+SET RETURN_DATE=CURRENT_DATE
+WHERE LOG_ID=v_log_id;
+END$$
+DELIMITER;//还书
+
+DELIMITER $$
+
+CREATE PROCEDURE GetUserBorrowHistory(
+    IN p_user_name VARCHAR(50)
+)
+BEGIN
+    SELECT 
+        BOOK_NAME,
+        COPY_ID,
+        BORROW_DATE,
+        RETURN_DATE,
+        CASE 
+            WHEN RETURN_DATE IS NULL THEN '未归还'
+            ELSE '已归还'
+        END as status
+    FROM MUTIFUNCTIONALLOGS
+    WHERE USER_NAME = p_user_name
+    ORDER BY BORROW_DATE DESC;
+END $$
+
+DELIMITER ;
+
+DELIMITER$$
+CREATE PROCEDURE PAY_FINE_RIGHT(IN p_user_id INT ,IN p_amount DECIMAL(10,2))
+BEGIN 
+DECLARE CURRENT_FINE DECIMAL(10,2);
+SELECT FINE INTO CURRENT_FINE 
+FROM users
+WHERE USER_ID=p_user_id;
+
+IF CURRENT_FINE IS NULL THEN 
+SIGNAL SQLSTATE'45000'
+SET MESSAGE_TEXT='没有这样的用户';
+END IF;
+
+IF p_amount>CURRENT_FINE THEN
+SIGNAL SQLSTATE'45000' 
+SET MESSAGE_TEXT='这里没有充值余额的功能';
+END IF;
+
+UPDATE users 
+SET FINE=FINE-p_amount
+WHERE USER_ID=p_user_id;
+IF CURRENT_FINE-p_amount<=0 THEN 
+UPDATE users
+SET PERMISSION=TRUE
+WHERE USER_ID=p_user_id;
+SELECT 'FINE PAY OFF' AS result;
+ELSE 
+SELECT CONCAT('SUCESSFULLY PAID,FINE LEFT:',CURRENT_FINE-p_amount) AS result;
+
+END IF;
+END$$
+DELIMITER;
+
+
+DELIMITER $$
+
+CREATE PROCEDURE GetAvailableBooks(
+    IN p_book_name VARCHAR(100),
+    IN p_author VARCHAR(50)
+)
+BEGIN
+    SELECT 
+        b.BOOKID,
+        b.BOOKNAME,
+        b.AUTHORNAME,
+        b.PUBLISHER,
+        b.PUBLISH_DATE,
+        COUNT(DISTINCT cp.COPY_ID) as available_copies,
+        GROUP_CONCAT(DISTINCT CONCAT('F', cp.FLOOR, '-S', cp.STACK, '-L', cp.LAYER)) as locations
+    FROM BOOK_INFORMATION b
+    LEFT JOIN COPY cp ON b.BOOKID = cp.BOOKID AND cp.STATUS = 'AVAILABLE'
+    WHERE (p_book_name IS NULL OR b.BOOKNAME LIKE CONCAT('%', p_book_name, '%'))
+      AND (p_author IS NULL OR b.AUTHORNAME LIKE CONCAT('%', p_author, '%'))
+      AND cp.COPY_ID IS NOT NULL  
+    GROUP BY b.BOOKID
+    ORDER BY b.BOOKNAME;
+END $$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE PROCEDURE ManageUser(
+    IN p_username VARCHAR(50),
+    IN p_usertype ENUM('STUDENT', 'TEACHER', 'STAFF'),
+    IN p_action VARCHAR(20)
+)
+BEGIN
+    DECLARE v_user_exists INT;
+    
+    SELECT COUNT(*) INTO v_user_exists 
+    FROM users 
+    WHERE USER_NAME = p_username;
+    
+    IF p_action = 'ADD' THEN
+        IF v_user_exists > 0 THEN
+            SIGNAL SQLSTATE '45000' 
+            SET MESSAGE_TEXT = '用户已存在';
+        END IF;
+        INSERT INTO users(USER_NAME, USER_TYPE, PERMISSION)
+        VALUES (p_username, p_usertype, TRUE);
+        
+        SELECT CONCAT('用户添加成功：', p_username, '，类型：', p_usertype) AS result;
+        
+    ELSEIF p_action = 'ENABLE' THEN
+        IF v_user_exists = 0 THEN
+            SIGNAL SQLSTATE '45000' 
+            SET MESSAGE_TEXT = '用户不存在';
+        END IF;
+        
+        UPDATE users 
+        SET PERMISSION = TRUE 
+        WHERE USER_NAME = p_username;
+        
+        SELECT CONCAT('用户权限已启用：', p_username) AS result;
+        
+    ELSEIF p_action = 'DISABLE' THEN
+        IF v_user_exists = 0 THEN
+            SIGNAL SQLSTATE '45000' 
+            SET MESSAGE_TEXT = '用户不存在';
+        END IF;
+      
+        UPDATE users 
+        SET PERMISSION = FALSE 
+        WHERE USER_NAME = p_username;
+        
+        SELECT CONCAT('用户权限已禁用：', p_username) AS result;
+        
+    ELSEIF p_action = 'RESET_FINE' THEN
+        IF v_user_exists = 0 THEN
+            SIGNAL SQLSTATE '45000' 
+            SET MESSAGE_TEXT = '用户不存在';
+        END IF;
+        UPDATE users 
+        SET FINE = 0, PERMISSION = TRUE 
+        WHERE USER_NAME = p_username;
+        
+        SELECT CONCAT('罚款已清零，权限已恢复：', p_username) AS result;
+        
+    ELSE
+        SIGNAL SQLSTATE '45000' 
+        SET MESSAGE_TEXT = '无效的操作类型';
+    END IF;
+END $$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE PROCEDURE AddNewBook(
+    IN p_isbn VARCHAR(20),
+    IN p_bookname VARCHAR(50),
+    IN p_category_id INT,
+    IN p_authorname VARCHAR(50),
+    IN p_publisher VARCHAR(50),
+    IN p_copies INT,
+    IN p_floor INT,
+    IN p_stack INT,
+    IN p_start_layer INT
+)
+BEGIN
+    DECLARE v_book_id INT;
+    DECLARE i INT DEFAULT 0;
+    INSERT INTO BOOK_INFORMATION(
+        ISBN, BOOKNAME, CATEGORY_ID, AUTHORNAME, PUBLISHER
+    ) VALUES (
+        p_isbn, p_bookname, p_category_id, p_authorname, p_publisher
+    );
+    
+    SET v_book_id = LAST_INSERT_ID();
+    WHILE i < p_copies DO
+        INSERT INTO COPY(
+            BOOKID, FLOOR, STACK, LAYER, STATUS
+        ) VALUES (
+            v_book_id, 
+            p_floor, 
+            p_stack, 
+            p_start_layer + i, 
+            'AVAILABLE'
+        );
+        SET i = i + 1;
+    END WHILE;
+    
+    SELECT CONCAT('添加成功，图书ID：', v_book_id, '，副本数量：', p_copies) AS result;
+END $$
+
+DELIMITER ;
+
+
